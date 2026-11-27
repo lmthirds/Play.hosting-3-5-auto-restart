@@ -155,30 +155,78 @@ def is_button_text_visible(sb: Any, text: str) -> bool:
     return bool(cdp_eval(sb, js, False))
 
 
+def dismiss_consent_modal(sb: Any) -> bool:
+    """自动关闭欧洲节点触发的 GDPR / Google 隐私同意弹窗"""
+    js = """(() => {
+        const selectors = [
+            'button.fc-cta-consent',
+            '.fc-consent-root button.fc-primary-button',
+            'button[aria-label="Consent"]'
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el) {
+                const r = el.getBoundingClientRect();
+                const st = window.getComputedStyle(el);
+                if (r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none') {
+                    el.click();
+                    return 'selector:' + sel;
+                }
+            }
+        }
+        const btns = Array.from(document.querySelectorAll('button'));
+        for (const b of btns) {
+            const t = (b.innerText || '').trim().toLowerCase();
+            if (t === 'consent' || t === 'accept all' || t === 'i agree') {
+                const r = b.getBoundingClientRect();
+                const st = window.getComputedStyle(b);
+                if (r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none') {
+                    b.click();
+                    return 'text:' + t;
+                }
+            }
+        }
+        return '';
+    })()"""
+    res = cdp_eval(sb, js, "")
+    if res:
+        print(f"[Auth] 检测到隐私同意弹窗，已自动点击 Consent ({res})")
+        sb.sleep(1.5)
+        return True
+    return False
+
+
 def click_button_by_text(
     sb: Any,
     include_text: str,
     exclude_text: str = "",
     in_header_only: bool = False,
+    require_ready: bool = True,
 ) -> bool:
     js = f"""(() => {{
         document.querySelectorAll('[data-ph-target]').forEach(e => e.removeAttribute('data-ph-target'));
         const kw = {json.dumps(include_text)}.toLowerCase();
         const ex = {json.dumps(exclude_text)}.toLowerCase();
+        const requireReady = {json.dumps(require_ready)};
         const root = {json.dumps(in_header_only)} ? (document.querySelector('header') || document) : document;
         const btns = Array.from(root.querySelectorAll('button'));
         for (const b of btns) {{
-            if (b.disabled) continue;
             const t = (b.innerText || '').trim().toLowerCase();
             if (!t.includes(kw)) continue;
             if (ex && t.includes(ex)) continue;
             const r = b.getBoundingClientRect();
             const st = window.getComputedStyle(b);
-            if (r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none') {{
-                b.scrollIntoView({{ block: 'center' }});
-                b.setAttribute('data-ph-target', '1');
-                return true;
+            if (r.width <= 0 || r.height <= 0 || st.visibility === 'hidden' || st.display === 'none') continue;
+            if (requireReady) {{
+                const ariaDisabled = b.getAttribute('aria-disabled') === 'true';
+                const opacity = parseFloat(st.opacity || '1');
+                if (b.disabled || ariaDisabled || st.pointerEvents === 'none' || opacity < 0.75) {{
+                    continue;
+                }}
             }}
+            b.scrollIntoView({{ block: 'center' }});
+            b.setAttribute('data-ph-target', '1');
+            return true;
         }}
         return false;
     }})()"""
@@ -255,7 +303,6 @@ def click_turnstile_by_pyautogui(sb: Any) -> bool:
                 }
             }
 
-            // 兜底匹配 Cloudflare 全屏盾标准 300x65 卡片容器
             const divs = Array.from(document.querySelectorAll('div'));
             for (const d of divs) {
                 const r = d.getBoundingClientRect();
@@ -280,7 +327,6 @@ def click_turnstile_by_pyautogui(sb: Any) -> bool:
         f"box=({int(info['left'])},{int(info['top'])},{int(info['width'])}x{int(info['height'])})]"
     )
 
-    # 先移动一段随机起始距离再缓动移到复选框点击
     pyautogui.moveTo(
         max(10, abs_x - random.randint(80, 160)),
         max(10, abs_y + random.randint(-50, 50)),
@@ -298,7 +344,6 @@ def click_turnstile_by_pyautogui(sb: Any) -> bool:
 
 
 def attempt_click_cf(sb: Any, attempt_no: int) -> None:
-    # 奇数次使用 SeleniumBase 内置 GUI 点击，偶数次使用精确坐标 PyAutoGUI 点击
     if attempt_no % 2 == 1:
         try:
             print(f"[Auth] 第 {attempt_no} 次过盾尝试：SeleniumBase uc_gui_click_captcha()")
@@ -380,13 +425,16 @@ def wait_for_login_form_or_bypass_cf(sb: Any, max_wait: int = 80) -> None:
     )
 
 
-def wait_and_solve_login_turnstile(sb: Any, max_wait: int = 50) -> bool:
+def wait_and_solve_login_turnstile(sb: Any, max_wait: int = 55) -> bool:
     print("[Auth] 等待登录页 Cloudflare Turnstile 验证...")
     start_ts = time.time()
     clicked_times = 0
     last_click_ts = 0.0
 
     while time.time() - start_ts < max_wait:
+        # 防止 GDPR 隐私弹窗延迟弹出遮挡验证框
+        dismiss_consent_modal(sb)
+
         token = get_turnstile_token(sb)
         if len(token) > 10:
             print("[Auth] 登录页 Turnstile 验证已通过")
@@ -415,6 +463,10 @@ def login_play_hosting(sb: Any, email: str, password: str) -> None:
     if "/auth/login" not in (sb.cdp.get_current_url() or ""):
         return
 
+    # 进入登录页后先等待并清理可能出现的 GDPR 弹窗
+    sb.sleep(1.5)
+    dismiss_consent_modal(sb)
+
     email_sel = 'input[type="email"], input[name="email"], input[autocomplete="email"]'
     pass_sel = 'input[type="password"]'
 
@@ -423,14 +475,17 @@ def login_play_hosting(sb: Any, email: str, password: str) -> None:
     sb.cdp.type(email_sel, email)
     sb.sleep(random.uniform(0.4, 0.9))
 
+    dismiss_consent_modal(sb)
+
     sb.cdp.click(pass_sel)
     sb.sleep(random.uniform(0.2, 0.5))
     sb.cdp.type(pass_sel, password)
     sb.sleep(random.uniform(0.5, 1.0))
 
-    wait_and_solve_login_turnstile(sb, max_wait=50)
+    wait_and_solve_login_turnstile(sb, max_wait=55)
 
-    if not click_button_by_text(sb, "Log in"):
+    dismiss_consent_modal(sb)
+    if not click_button_by_text(sb, "Log in", require_ready=False):
         sb.cdp.click('button[type="submit"]')
     print("[Auth] 已点击 Log in，等待登录跳转...")
 
@@ -461,6 +516,7 @@ def open_server_page(sb: Any, server_id: str) -> str:
         print("[Panel] 未指定 server_id，尝试自动打开第一个服务器...")
         deadline_link = time.time() + 20
         while time.time() < deadline_link:
+            dismiss_consent_modal(sb)
             if is_css_visible(sb, 'a[href*="/server/"]'):
                 sb.cdp.click('a[href*="/server/"]')
                 break
@@ -476,12 +532,14 @@ def open_server_page(sb: Any, server_id: str) -> str:
         "Starting",
     )
     while time.time() < deadline:
+        dismiss_consent_modal(sb)
         text = get_body_text(sb)
         if any(k in text for k in keywords):
             break
         sb.sleep(1.5)
 
     sb.sleep(3)
+    dismiss_consent_modal(sb)
     return sb.cdp.get_current_url() or ""
 
 
@@ -511,20 +569,45 @@ def detect_server_state(sb: Any) -> str:
     return "unknown"
 
 
-def click_start_button(sb: Any) -> None:
-    if click_button_by_text(sb, "Start", in_header_only=True):
-        print("[Action] 已点击顶栏 Start 按钮")
+def click_start_button(sb: Any, max_wait: int = 45) -> None:
+    """等待面板控制台加载完毕、Start 按钮解除置灰后再点击开机"""
+    print(f"[Action] 等待 Start 开机按钮就绪（最长 {max_wait}s）...")
+    deadline = time.time() + max_wait
+    logged_waiting = False
+
+    while time.time() < deadline:
+        dismiss_consent_modal(sb)
+
+        # 若服务器已自动进入启动/在线态，无需再点
+        cur_state = detect_server_state(sb)
+        if cur_state in ("starting", "online"):
+            print(f"[Action] 服务器已自动变为 {cur_state}，跳过点击 Start")
+            return
+
+        if click_button_by_text(sb, "Start", in_header_only=True, require_ready=True):
+            print("[Action] 已点击顶栏 Start 按钮")
+            return
+        if click_button_by_text(sb, "Start", exclude_text="Start server", require_ready=True):
+            print("[Action] 已点击 Start 按钮")
+            return
+        if click_button_by_text(sb, "Start server", require_ready=True):
+            print("[Action] 已点击 Start server 按钮")
+            return
+        if click_button_by_text(sb, "Start", require_ready=True):
+            print("[Action] 已点击可用 Start 按钮")
+            return
+
+        if not logged_waiting:
+            print("[Action] Start 按钮暂未就绪（控制台正在加载），等待解除置灰...")
+            logged_waiting = True
+        sb.sleep(2.5)
+
+    # 超时前最后尝试强制点击一次
+    if click_button_by_text(sb, "Start", require_ready=False):
+        print("[Action] 等待超时，已尝试兜底点击 Start 按钮")
         return
-    if click_button_by_text(sb, "Start", exclude_text="Start server"):
-        print("[Action] 已点击 Start 按钮")
-        return
-    if click_button_by_text(sb, "Start server"):
-        print("[Action] 已点击 Start server 按钮")
-        return
-    if click_button_by_text(sb, "Start"):
-        print("[Action] 已兜底点击 Start 按钮")
-        return
-    raise RuntimeError("未找到可点击的 Start 开机按钮")
+
+    raise RuntimeError(f"等待 {max_wait}s 后仍未找到可点击的 Start 开机按钮")
 
 
 def wait_for_restore_complete(sb: Any, max_wait: int = 240) -> str:
@@ -544,6 +627,8 @@ def wait_for_boot(sb: Any, max_wait: int = 120) -> str:
     deadline = time.time() + max_wait
     reached_starting = False
     starting_since: Optional[float] = None
+    retried_start = False
+    start_ts = time.time()
 
     while time.time() < deadline:
         state = detect_server_state(sb)
@@ -556,6 +641,14 @@ def wait_for_boot(sb: Any, max_wait: int = 120) -> str:
                 starting_since = time.time()
             elif starting_since and time.time() - starting_since >= 35:
                 return "starting"
+        elif state == "offline" and not retried_start and (time.time() - start_ts >= 12):
+            # 若第一次点击刚好撞上面板重连未生效，补点一次
+            print("[Action] 12 秒后仍为 offline，补点一次 Start 按钮...")
+            retried_start = True
+            try:
+                click_start_button(sb, max_wait=20)
+            except Exception as e:
+                print(f"[Action] 补点 Start 失败: {e}")
         sb.sleep(5)
 
     return detect_server_state(sb)
@@ -616,7 +709,6 @@ def process_single_account(
             user_data_dir=user_data_dir,
             locale_code="en",
         ) as sb:
-            # 进入 CDP 模式前将窗口锚定在 (0, 0)，确保 PyAutoGUI 坐标准确
             try:
                 sb.driver.set_window_rect(
                     x=0, y=0, width=viewport["width"], height=viewport["height"]
@@ -643,7 +735,7 @@ def process_single_account(
                     state = wait_for_restore_complete(sb)
 
                 if state == "offline":
-                    click_start_button(sb)
+                    click_start_button(sb, max_wait=45)
                     actions.append("点击 Start 开机")
                     sb.sleep(4)
                     state = wait_for_boot(sb)
