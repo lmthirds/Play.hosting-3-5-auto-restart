@@ -10,8 +10,6 @@ from urllib.parse import parse_qs, unquote, urlparse
 import requests
 
 LOCAL_PROXY_HOST = "127.0.0.1"
-LOCAL_PROXY_PORT = 10808
-CONFIG_PATH = "/tmp/singbox_config.json"
 
 
 def _pad_b64(s: str) -> str:
@@ -108,7 +106,6 @@ def parse_vless(uri: str) -> Dict[str, Any]:
         if fp:
             tls_cfg["utls"] = {"enabled": True, "fingerprint": fp}
         elif security == "reality":
-            # sing-box 要求 Reality 必须启用 uTLS
             tls_cfg["utls"] = {"enabled": True, "fingerprint": "chrome"}
 
         if security == "reality":
@@ -323,12 +320,18 @@ def parse_ss(uri: str) -> Dict[str, Any]:
     }
 
 
-def build_singbox_config(proxy_uri: str) -> Dict[str, Any]:
+def build_singbox_config(proxy_uri: str, local_port: int) -> Tuple[Dict[str, Any], int]:
     proxy_uri = proxy_uri.strip()
     if proxy_uri.startswith("{"):
         custom = json.loads(proxy_uri)
         if "inbounds" in custom and "outbounds" in custom:
-            return custom
+            inbounds = custom.get("inbounds") or []
+            actual_port = (
+                int(inbounds[0].get("listen_port", local_port))
+                if inbounds
+                else local_port
+            )
+            return custom, actual_port
         custom["tag"] = "proxy"
         outbound = custom
     else:
@@ -346,14 +349,14 @@ def build_singbox_config(proxy_uri: str) -> Dict[str, Any]:
         else:
             raise ValueError(f"不支持的代理协议: {scheme}")
 
-    return {
+    config = {
         "log": {"level": "warn"},
         "inbounds": [
             {
                 "type": "mixed",
                 "tag": "mixed-in",
                 "listen": LOCAL_PROXY_HOST,
-                "listen_port": LOCAL_PROXY_PORT,
+                "listen_port": local_port,
             }
         ],
         "outbounds": [
@@ -364,46 +367,53 @@ def build_singbox_config(proxy_uri: str) -> Dict[str, Any]:
             "final": "proxy",
         },
     }
+    return config, local_port
 
 
 class SingBoxProxy:
-    def __init__(self, proxy_uri: str):
-        self.proxy_uri = proxy_uri.strip()
+    def __init__(self, proxy_uri: str, local_port: int = 10808):
+        self.proxy_uri = (proxy_uri or "").strip()
+        self.local_port = local_port
+        self.config_path = f"/tmp/singbox_config_{local_port}.json"
         self.proc: Optional[subprocess.Popen] = None
         self.exit_ip: Optional[str] = None
         self.protocol: str = "direct"
 
     @property
     def local_proxy_url(self) -> str:
-        return f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
+        return f"http://{LOCAL_PROXY_HOST}:{self.local_port}"
 
     def start(self) -> str:
         if not self.proxy_uri:
-            print("[Proxy] 未配置 PROXY_URL，使用直连模式")
+            print("[Proxy] 该账号未配置代理节点，使用直连模式")
             return ""
 
-        config = build_singbox_config(self.proxy_uri)
-        self.protocol = config["outbounds"][0].get("type", "custom")
+        config, actual_port = build_singbox_config(self.proxy_uri, self.local_port)
+        self.local_port = actual_port
+        self.config_path = f"/tmp/singbox_config_{self.local_port}.json"
+        outbounds = config.get("outbounds") or []
+        self.protocol = outbounds[0].get("type", "custom") if outbounds else "custom"
 
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
         print(f"[Proxy] 正在启动 sing-box ({self.protocol}) -> {self.local_proxy_url}")
         self.proc = subprocess.Popen(
-            ["sing-box", "run", "-c", CONFIG_PATH],
+            ["sing-box", "run", "-c", self.config_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
 
-        # 等待本地端口就绪
         ready = False
         for _ in range(30):
             if self.proc.poll() is not None:
                 _, err = self.proc.communicate(timeout=3)
                 raise RuntimeError(f"sing-box 启动失败退出:\n{err.strip()}")
             try:
-                with socket.create_connection((LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), timeout=1):
+                with socket.create_connection(
+                    (LOCAL_PROXY_HOST, self.local_port), timeout=1
+                ):
                     ready = True
                     break
             except OSError:
@@ -413,7 +423,6 @@ class SingBoxProxy:
             self.stop()
             raise RuntimeError("sing-box 本地端口监听超时")
 
-        # 验证代理连通性与出口 IP
         self.exit_ip = self._check_exit_ip()
         print(f"[Proxy] sing-box 代理连通成功，出口 IP: {self.exit_ip}")
         return self.local_proxy_url
@@ -442,8 +451,9 @@ class SingBoxProxy:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
-        if os.path.exists(CONFIG_PATH):
+                self.proc.wait(timeout=3)
+        if os.path.exists(self.config_path):
             try:
-                os.remove(CONFIG_PATH)
+                os.remove(self.config_path)
             except OSError:
                 pass
