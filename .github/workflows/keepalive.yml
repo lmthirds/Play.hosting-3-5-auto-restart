@@ -1,4 +1,4 @@
-name: Play.Hosting Auto Keepalive
+name: Play.Hosting Multi-Account Keepalive
 
 on:
   schedule:
@@ -9,7 +9,7 @@ on:
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -42,22 +42,23 @@ jobs:
           patchright install chromium
           patchright install-deps chromium
 
-      - name: Run Play.Hosting Keeper
+      - name: Run Play.Hosting Multi-Account Keeper
         env:
-          PLAY_EMAIL: ${{ secrets.PLAY_EMAIL }}
-          PLAY_PASSWORD: ${{ secrets.PLAY_PASSWORD }}
-          PLAY_SERVER_ID: ${{ secrets.PLAY_SERVER_ID }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 可选防检测参数（留空则使用默认值）
+          ACCOUNT_DELAY_MIN: "15"
+          ACCOUNT_DELAY_MAX: "40"
+          SHUFFLE_ACCOUNTS: "true"
         run: |
-          xvfb-run -a --server-args="-screen 0 1366x768x24" python main.py
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python main.py
 
-      - name: Upload result screenshot
+      - name: Upload result screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: play-hosting-screenshot
-          path: result.png
+          name: play-hosting-screenshots
+          path: screenshots/
           if-no-files-found: ignore
           retention-days: 3
