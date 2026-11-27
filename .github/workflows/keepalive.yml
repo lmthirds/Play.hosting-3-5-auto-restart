@@ -33,12 +33,13 @@ jobs:
           sudo chmod +x /usr/local/bin/sing-box
           sing-box version
 
-      - name: Install dependencies and Chromium
+      - name: Install dependencies and Chrome
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
           pip install --upgrade pip
           pip install -r requirements.txt
+          patchright install chrome || true
           patchright install chromium
           patchright install-deps chromium
 
@@ -47,7 +48,7 @@ jobs:
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # 可选防检测参数（留空则使用默认值）
+          # 防检测空置冷却与随机顺序配置
           ACCOUNT_DELAY_MIN: "15"
           ACCOUNT_DELAY_MAX: "40"
           SHUFFLE_ACCOUNTS: "true"
