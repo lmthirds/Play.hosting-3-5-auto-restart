@@ -113,49 +113,223 @@ def load_accounts() -> List[Dict[str, str]]:
     raise ValueError("未配置 ACCOUNTS_JSON（或单账号 PLAY_EMAIL / PLAY_PASSWORD）")
 
 
-def get_body_text(sb: Any) -> str:
+def cdp_eval(sb: Any, js_iife: str, default: Any = None) -> Any:
     try:
-        return sb.get_text("body") or ""
+        return sb.cdp.evaluate(js_iife)
     except Exception:
-        return ""
+        return default
+
+
+def get_body_text(sb: Any) -> str:
+    text = cdp_eval(
+        sb,
+        "(() => (document.body && document.body.innerText) ? document.body.innerText : '')()",
+        "",
+    )
+    return str(text or "")
+
+
+def is_css_visible(sb: Any, css_selector: str) -> bool:
+    js = f"""(() => {{
+        const el = document.querySelector({json.dumps(css_selector)});
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const st = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+    }})()"""
+    return bool(cdp_eval(sb, js, False))
+
+
+def is_button_text_visible(sb: Any, text: str) -> bool:
+    js = f"""(() => {{
+        const kw = {json.dumps(text)}.toLowerCase();
+        const btns = Array.from(document.querySelectorAll('button, a'));
+        return btns.some(b => {{
+            const t = (b.innerText || '').trim().toLowerCase();
+            if (!t.includes(kw)) return false;
+            const r = b.getBoundingClientRect();
+            const st = window.getComputedStyle(b);
+            return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+        }});
+    }})()"""
+    return bool(cdp_eval(sb, js, False))
+
+
+def click_button_by_text(
+    sb: Any,
+    include_text: str,
+    exclude_text: str = "",
+    in_header_only: bool = False,
+) -> bool:
+    js = f"""(() => {{
+        document.querySelectorAll('[data-ph-target]').forEach(e => e.removeAttribute('data-ph-target'));
+        const kw = {json.dumps(include_text)}.toLowerCase();
+        const ex = {json.dumps(exclude_text)}.toLowerCase();
+        const root = {json.dumps(in_header_only)} ? (document.querySelector('header') || document) : document;
+        const btns = Array.from(root.querySelectorAll('button'));
+        for (const b of btns) {{
+            if (b.disabled) continue;
+            const t = (b.innerText || '').trim().toLowerCase();
+            if (!t.includes(kw)) continue;
+            if (ex && t.includes(ex)) continue;
+            const r = b.getBoundingClientRect();
+            const st = window.getComputedStyle(b);
+            if (r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none') {{
+                b.scrollIntoView({{ block: 'center' }});
+                b.setAttribute('data-ph-target', '1');
+                return true;
+            }}
+        }}
+        return false;
+    }})()"""
+    if not cdp_eval(sb, js, False):
+        return False
+
+    sb.sleep(0.3)
+    try:
+        sb.cdp.click('[data-ph-target="1"]')
+        return True
+    except Exception:
+        return bool(
+            cdp_eval(
+                sb,
+                """(() => {
+                    const el = document.querySelector('[data-ph-target="1"]');
+                    if (el) { el.click(); return true; }
+                    return false;
+                })()""",
+                False,
+            )
+        )
 
 
 def get_turnstile_token(sb: Any) -> str:
-    try:
-        token = sb.execute_script(
-            """
+    token = cdp_eval(
+        sb,
+        """(() => {
             const el = document.querySelector('input[name="cf-turnstile-response"]');
             return el ? el.value : '';
-            """
-        )
-        return str(token or "")
-    except Exception:
-        return ""
+        })()""",
+        "",
+    )
+    return str(token or "")
 
 
-def try_uc_gui_click(sb: Any) -> None:
+def click_turnstile_by_pyautogui(sb: Any) -> bool:
+    import pyautogui
+
+    pyautogui.FAILSAFE = False
+
+    info = cdp_eval(
+        sb,
+        """(() => {
+            const winX = window.screenX || 0;
+            const winY = window.screenY || 0;
+            const barH = Math.max(0, window.outerHeight - window.innerHeight);
+            const barW = Math.max(0, window.outerWidth - window.innerWidth);
+
+            const sels = [
+                'iframe[src*="challenges.cloudflare.com"]',
+                'iframe[title*="Cloudflare"]',
+                'iframe[title*="challenge"]'
+            ];
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 20 && r.height > 20) {
+                        return { source: sel, winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height };
+                    }
+                }
+            }
+
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            if (inp) {
+                let el = inp.parentElement;
+                while (el && el !== document.body) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 150 && r.height >= 45 && r.height <= 140) {
+                        return { source: 'turnstile-parent', winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height };
+                    }
+                    el = el.parentElement;
+                }
+            }
+
+            // 兜底匹配 Cloudflare 全屏盾标准 300x65 卡片容器
+            const divs = Array.from(document.querySelectorAll('div'));
+            for (const d of divs) {
+                const r = d.getBoundingClientRect();
+                if (r.width >= 260 && r.width <= 360 && r.height >= 55 && r.height <= 90 && r.top > 120 && r.top < 600) {
+                    return { source: 'widget-box', winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height };
+                }
+            }
+            return null;
+        })()""",
+        None,
+    )
+
+    if not isinstance(info, dict):
+        print("[Auth] 未定位到 Turnstile 容器坐标")
+        return False
+
+    abs_x = int(info["winX"] + info["barW"] / 2 + info["left"] + random.uniform(25, 34))
+    abs_y = int(info["winY"] + info["barH"] + info["top"] + info["height"] / 2 + random.uniform(-3, 3))
+    print(
+        f"[Auth] PyAutoGUI 精确点击 ({abs_x}, {abs_y}) "
+        f"[来源={info['source']}, win=({info['winX']},{info['winY']}), barH={info['barH']}, "
+        f"box=({int(info['left'])},{int(info['top'])},{int(info['width'])}x{int(info['height'])})]"
+    )
+
+    # 先移动一段随机起始距离再缓动移到复选框点击
+    pyautogui.moveTo(
+        max(10, abs_x - random.randint(80, 160)),
+        max(10, abs_y + random.randint(-50, 50)),
+        duration=random.uniform(0.15, 0.3),
+    )
+    pyautogui.moveTo(
+        abs_x,
+        abs_y,
+        duration=random.uniform(0.4, 0.75),
+        tween=pyautogui.easeOutQuad,
+    )
+    time.sleep(random.uniform(0.1, 0.25))
+    pyautogui.click()
+    return True
+
+
+def attempt_click_cf(sb: Any, attempt_no: int) -> None:
+    # 奇数次使用 SeleniumBase 内置 GUI 点击，偶数次使用精确坐标 PyAutoGUI 点击
+    if attempt_no % 2 == 1:
+        try:
+            print(f"[Auth] 第 {attempt_no} 次过盾尝试：SeleniumBase uc_gui_click_captcha()")
+            sb.uc_gui_click_captcha()
+            return
+        except Exception as e:
+            print(f"[Auth] uc_gui_click_captcha 异常，改用精确坐标点击: {e}")
+
+    print(f"[Auth] 第 {attempt_no} 次过盾尝试：PyAutoGUI 精确坐标点击")
     try:
-        print("[Auth] 执行系统级 GUI 点击 Cloudflare 验证框...")
-        sb.uc_gui_click_captcha()
+        if not click_turnstile_by_pyautogui(sb):
+            sb.uc_gui_click_captcha()
     except Exception as e:
-        print(f"[Auth] GUI 点击尝试返回异常（可忽略）: {e}")
+        print(f"[Auth] 精确坐标点击异常: {e}")
 
 
-def wait_for_login_form_or_bypass_cf(sb: Any, max_wait: int = 75) -> None:
-    print("[Auth] 等待登录表单加载（UC 模式自动过 Cloudflare 全屏盾）...")
+def wait_for_login_form_or_bypass_cf(sb: Any, max_wait: int = 80) -> None:
+    print("[Auth] 等待登录表单加载（纯 CDP 模式自动过 Cloudflare 全屏盾）...")
     start_ts = time.time()
     last_title = ""
     clicked_times = 0
     last_click_ts = 0.0
 
     while time.time() - start_ts < max_wait:
-        if sb.is_element_visible('input[type="password"]'):
+        if is_css_visible(sb, 'input[type="password"]'):
             print("[Auth] 登录表单已加载完成")
             return
 
         current_url = ""
         try:
-            current_url = sb.get_current_url() or ""
+            current_url = sb.cdp.get_current_url() or ""
         except Exception:
             pass
 
@@ -164,7 +338,7 @@ def wait_for_login_form_or_bypass_cf(sb: Any, max_wait: int = 75) -> None:
             return
 
         try:
-            title = sb.get_title() or ""
+            title = sb.cdp.get_title() or ""
         except Exception:
             title = ""
 
@@ -174,20 +348,26 @@ def wait_for_login_form_or_bypass_cf(sb: Any, max_wait: int = 75) -> None:
 
         elapsed = time.time() - start_ts
         lower_title = title.lower()
+        body_lower = get_body_text(sb).lower()
         is_cf_shield = any(
-            kw in lower_title
-            for kw in ("just a moment", "attention required", "cloudflare", "请稍候", "verify")
+            kw in lower_title or kw in body_lower
+            for kw in (
+                "just a moment",
+                "performing security verification",
+                "attention required",
+                "verify you are human",
+                "请稍候",
+            )
         )
 
-        # 全屏盾出现时，调用系统级鼠标点击，每次间隔至少 12 秒
         if (
             is_cf_shield
             and clicked_times < 4
-            and elapsed > 4
-            and (time.time() - last_click_ts >= 12)
+            and elapsed > 5
+            and (time.time() - last_click_ts >= 13)
         ):
-            try_uc_gui_click(sb)
             clicked_times += 1
+            attempt_click_cf(sb, clicked_times)
             last_click_ts = time.time()
             sb.sleep(5)
             continue
@@ -214,8 +394,8 @@ def wait_and_solve_login_turnstile(sb: Any, max_wait: int = 50) -> bool:
 
         elapsed = time.time() - start_ts
         if elapsed > 6 and clicked_times < 3 and (time.time() - last_click_ts >= 12):
-            try_uc_gui_click(sb)
             clicked_times += 1
+            attempt_click_cf(sb, clicked_times)
             last_click_ts = time.time()
             sb.sleep(5)
             continue
@@ -227,35 +407,36 @@ def wait_and_solve_login_turnstile(sb: Any, max_wait: int = 50) -> bool:
 
 
 def login_play_hosting(sb: Any, email: str, password: str) -> None:
-    print(f"[Auth] 正在以 UC 断连模式打开登录页: {LOGIN_URL}")
-    sb.uc_open_with_reconnect(LOGIN_URL, 6)
+    print(f"[Auth] 正在以纯 CDP 模式打开登录页: {LOGIN_URL}")
+    sb.activate_cdp_mode(LOGIN_URL)
+    sb.sleep(4)
 
-    wait_for_login_form_or_bypass_cf(sb, max_wait=75)
-    if "/auth/login" not in (sb.get_current_url() or ""):
+    wait_for_login_form_or_bypass_cf(sb, max_wait=80)
+    if "/auth/login" not in (sb.cdp.get_current_url() or ""):
         return
 
     email_sel = 'input[type="email"], input[name="email"], input[autocomplete="email"]'
     pass_sel = 'input[type="password"]'
 
-    sb.click(email_sel)
+    sb.cdp.click(email_sel)
     sb.sleep(random.uniform(0.2, 0.5))
-    sb.type(email_sel, email)
+    sb.cdp.type(email_sel, email)
     sb.sleep(random.uniform(0.4, 0.9))
 
-    sb.click(pass_sel)
+    sb.cdp.click(pass_sel)
     sb.sleep(random.uniform(0.2, 0.5))
-    sb.type(pass_sel, password)
+    sb.cdp.type(pass_sel, password)
     sb.sleep(random.uniform(0.5, 1.0))
 
     wait_and_solve_login_turnstile(sb, max_wait=50)
 
-    login_btn_xpath = '//button[@type="submit" or contains(normalize-space(.), "Log in")]'
-    sb.click(login_btn_xpath)
+    if not click_button_by_text(sb, "Log in"):
+        sb.cdp.click('button[type="submit"]')
     print("[Auth] 已点击 Log in，等待登录跳转...")
 
     deadline = time.time() + 35
     while time.time() < deadline:
-        cur_url = sb.get_current_url() or ""
+        cur_url = sb.cdp.get_current_url() or ""
         if "/auth/login" not in cur_url:
             print(f"[Auth] 登录成功，当前页面: {cur_url}")
             sb.sleep(random.uniform(2.0, 3.5))
@@ -266,7 +447,7 @@ def login_play_hosting(sb: Any, email: str, password: str) -> None:
 
 
 def open_server_page(sb: Any, server_id: str) -> str:
-    cur_url = sb.get_current_url() or ""
+    cur_url = sb.cdp.get_current_url() or ""
     if server_id:
         target_url = (
             server_id
@@ -275,13 +456,16 @@ def open_server_page(sb: Any, server_id: str) -> str:
         )
         if target_url not in cur_url:
             print(f"[Panel] 跳转到服务器页面: {target_url}")
-            sb.uc_open_with_reconnect(target_url, 4)
+            sb.cdp.open(target_url)
     elif "/server/" not in cur_url:
         print("[Panel] 未指定 server_id，尝试自动打开第一个服务器...")
-        sb.wait_for_element_visible('a[href*="/server/"]', timeout=20)
-        sb.click('a[href*="/server/"]')
+        deadline_link = time.time() + 20
+        while time.time() < deadline_link:
+            if is_css_visible(sb, 'a[href*="/server/"]'):
+                sb.cdp.click('a[href*="/server/"]')
+                break
+            sb.sleep(1)
 
-    # 等待面板核心状态文案渲染
     deadline = time.time() + 40
     keywords = (
         "Server in limbo",
@@ -298,32 +482,29 @@ def open_server_page(sb: Any, server_id: str) -> str:
         sb.sleep(1.5)
 
     sb.sleep(3)
-    return sb.get_current_url() or ""
+    return sb.cdp.get_current_url() or ""
 
 
 def detect_server_state(sb: Any) -> str:
-    if sb.is_element_visible('//*[contains(text(), "Server in limbo")]') or sb.is_element_visible(
-        '//button[contains(., "Wake server")]'
-    ):
+    body_text = get_body_text(sb)
+
+    if "Server in limbo" in body_text or is_button_text_visible(sb, "Wake server"):
         return "limbo"
 
-    if sb.is_element_visible('//*[contains(text(), "Restoring server")]') or sb.is_element_visible(
-        '//*[contains(text(), "Resuming your server")]'
-    ):
+    if "Restoring server" in body_text or "Resuming your server" in body_text:
         return "restoring"
 
-    has_stop = sb.is_element_visible('//button[contains(., "Stop")]')
-    has_restart = sb.is_element_visible('//button[contains(., "Restart")]')
+    has_stop = is_button_text_visible(sb, "Stop")
+    has_restart = is_button_text_visible(sb, "Restart")
     if has_stop or has_restart:
-        body_text = get_body_text(sb)
         if "Starting" in body_text and "Online" not in body_text:
             return "starting"
         return "online"
 
     if (
-        sb.is_element_visible('//*[contains(text(), "Your server is offline")]')
-        or sb.is_element_visible('//button[contains(., "Start server")]')
-        or sb.is_element_visible('//button[contains(., "Start")]')
+        "Your server is offline" in body_text
+        or is_button_text_visible(sb, "Start server")
+        or is_button_text_visible(sb, "Start")
     ):
         return "offline"
 
@@ -331,31 +512,19 @@ def detect_server_state(sb: Any) -> str:
 
 
 def click_start_button(sb: Any) -> None:
-    candidates = [
-        '//header//button[contains(., "Start")]',
-        '//button[contains(., "Start") and not(contains(., "Start server"))]',
-        '//button[contains(., "Start server")]',
-        '//button[contains(., "Start")]',
-    ]
-    for xpath in candidates:
-        try:
-            if sb.is_element_visible(xpath):
-                sb.scroll_to(xpath)
-                sb.click(xpath)
-                print(f"[Action] 已点击开机按钮: {xpath}")
-                return
-        except Exception:
-            continue
-
-    # 兜底 JS 点击
-    sb.execute_script(
-        """
-        const btns = Array.from(document.querySelectorAll('button'));
-        const target = btns.find(b => (b.innerText || '').includes('Start') && !b.disabled);
-        if (target) target.click();
-        """
-    )
-    print("[Action] 已通过 JS 兜底点击 Start 按钮")
+    if click_button_by_text(sb, "Start", in_header_only=True):
+        print("[Action] 已点击顶栏 Start 按钮")
+        return
+    if click_button_by_text(sb, "Start", exclude_text="Start server"):
+        print("[Action] 已点击 Start 按钮")
+        return
+    if click_button_by_text(sb, "Start server"):
+        print("[Action] 已点击 Start server 按钮")
+        return
+    if click_button_by_text(sb, "Start"):
+        print("[Action] 已兜底点击 Start 按钮")
+        return
+    raise RuntimeError("未找到可点击的 Start 开机按钮")
 
 
 def wait_for_restore_complete(sb: Any, max_wait: int = 240) -> str:
@@ -390,6 +559,16 @@ def wait_for_boot(sb: Any, max_wait: int = 120) -> str:
         sb.sleep(5)
 
     return detect_server_state(sb)
+
+
+def save_cdp_screenshot(sb: Any, path: str) -> None:
+    try:
+        sb.cdp.save_screenshot(path)
+    except Exception:
+        try:
+            sb.save_screenshot(path)
+        except Exception:
+            pass
 
 
 def process_single_account(
@@ -437,7 +616,13 @@ def process_single_account(
             user_data_dir=user_data_dir,
             locale_code="en",
         ) as sb:
-            sb.set_window_size(viewport["width"], viewport["height"])
+            # 进入 CDP 模式前将窗口锚定在 (0, 0)，确保 PyAutoGUI 坐标准确
+            try:
+                sb.driver.set_window_rect(
+                    x=0, y=0, width=viewport["width"], height=viewport["height"]
+                )
+            except Exception:
+                sb.set_window_size(viewport["width"], viewport["height"])
 
             try:
                 login_play_hosting(sb, email, password)
@@ -448,7 +633,8 @@ def process_single_account(
                 state = initial_state
 
                 if state == "limbo":
-                    sb.click('//button[contains(., "Wake server")]')
+                    if not click_button_by_text(sb, "Wake server"):
+                        raise RuntimeError("检测到 Limbo 状态，但未找到 Wake server 按钮")
                     actions.append("点击 Wake server 唤醒")
                     sb.sleep(3)
                     state = wait_for_restore_complete(sb)
@@ -469,16 +655,13 @@ def process_single_account(
 
                 final_state = state
                 sb.sleep(2)
-                sb.save_screenshot(screenshot_path)
+                save_cdp_screenshot(sb, screenshot_path)
                 print(f"[Done] {name} 最终状态: {final_state}，截图: {screenshot_path}")
 
             except Exception as e:
                 error_msg = str(e)
                 print(f"[Error] {name} 执行异常: {error_msg}")
-                try:
-                    sb.save_screenshot(screenshot_path)
-                except Exception:
-                    pass
+                save_cdp_screenshot(sb, screenshot_path)
                 raise
 
     except Exception as e:
