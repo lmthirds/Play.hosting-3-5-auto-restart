@@ -2,7 +2,9 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -75,7 +77,7 @@ def load_accounts() -> List[Dict[str, str]]:
             raise ValueError(f"ACCOUNTS_JSON 格式解析失败，请检查 JSON 语法: {e}")
 
         if not isinstance(parsed, list) or not parsed:
-            raise ValueError("ACCOUNTS_JSON 必须是非空 JSON 数组 [...]")
+            raise ValueError("ACCOUNTS_JSON 必须是非空 JSON 数组")
 
         for i, item in enumerate(parsed, start=1):
             if not isinstance(item, dict):
@@ -95,7 +97,6 @@ def load_accounts() -> List[Dict[str, str]]:
             )
         return accounts
 
-    # 向下兼容单账号 Secrets 配置
     single_email = os.getenv("PLAY_EMAIL", "").strip()
     single_pass = os.getenv("PLAY_PASSWORD", "").strip()
     if single_email and single_pass:
@@ -121,8 +122,112 @@ def is_visible(page: Page, selector: str, timeout: int = 1200) -> bool:
         return False
 
 
+def _click_turnstile_checkbox(page: Page) -> bool:
+    # 方式 1：直接匹配 Cloudflare Turnstile iframe
+    iframe_selectors = [
+        'iframe[src*="challenges.cloudflare.com"]',
+        'iframe[title*="Cloudflare"]',
+        'iframe[title*="challenge"]',
+    ]
+    for sel in iframe_selectors:
+        try:
+            box = page.locator(sel).first.bounding_box(timeout=1500)
+            if box and box["width"] > 20 and box["height"] > 20:
+                tx = box["x"] + random.uniform(24, 34)
+                ty = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+                print(f"[Auth] 点击 Turnstile iframe ({int(tx)}, {int(ty)})")
+                page.mouse.move(tx, ty, steps=random.randint(10, 18))
+                time.sleep(random.uniform(0.25, 0.5))
+                page.mouse.click(tx, ty)
+                return True
+        except Exception:
+            continue
+
+    # 方式 2：兼容 Closed Shadow DOM（通过 cf-turnstile-response 父容器坐标点击）
+    try:
+        box = page.evaluate(
+            """() => {
+                const inp = document.querySelector('input[name="cf-turnstile-response"]');
+                if (!inp) return null;
+                let el = inp.parentElement;
+                while (el && el !== document.body) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 150 && r.height >= 45 && r.height <= 140) {
+                        return { x: r.left, y: r.top, width: r.width, height: r.height };
+                    }
+                    el = el.parentElement;
+                }
+                return null;
+            }"""
+        )
+        if box:
+            tx = box["x"] + random.uniform(24, 34)
+            ty = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+            print(f"[Auth] 点击 Turnstile 容器 ({int(tx)}, {int(ty)})")
+            page.mouse.move(tx, ty, steps=random.randint(10, 18))
+            time.sleep(random.uniform(0.25, 0.5))
+            page.mouse.click(tx, ty)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def wait_for_login_form_or_bypass_cf(page: Page, max_wait: int = 65) -> None:
+    print("[Auth] 等待登录表单渲染（自动兼容 Cloudflare 全屏盾）...")
+    start_ts = time.time()
+    last_title = ""
+    clicked_times = 0
+
+    while time.time() - start_ts < max_wait:
+        if is_visible(page, 'input[type="password"]', timeout=1000):
+            print("[Auth] 登录表单已加载完成")
+            return
+
+        if "/server/" in page.url:
+            print("[Auth] 页面已直接跳转至服务器面板")
+            return
+
+        try:
+            title = page.title() or ""
+        except Exception:
+            title = ""
+
+        if title != last_title:
+            print(f"[Auth] 当前页面标题: {title!r} | URL: {page.url}")
+            last_title = title
+
+        elapsed = time.time() - start_ts
+        lower_title = title.lower()
+        is_cf_shield = any(
+            kw in lower_title
+            for kw in ("just a moment", "attention required", "cloudflare", "请稍候", "verify")
+        )
+
+        # 全屏人机盾超过 6 秒未自动放行时，尝试模拟人工点击验证框
+        if elapsed > 6 and clicked_times < 4 and (is_cf_shield or int(elapsed) % 10 < 2):
+            if _click_turnstile_checkbox(page):
+                clicked_times += 1
+                time.sleep(5)
+                continue
+
+        time.sleep(1.5)
+
+    # 超时前打印诊断信息，方便在日志中直接判断原因
+    snippet = ""
+    try:
+        snippet = (page.locator("body").inner_text(timeout=3000) or "").strip()
+        snippet = re.sub(r"\s+", " ", snippet)[:200]
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"等待登录表单超时({max_wait}s) | Title: {last_title!r} | URL: {page.url} | 页面文本: {snippet}"
+    )
+
+
 def wait_and_solve_turnstile(page: Page, max_wait: int = 50) -> bool:
-    print("[Auth] 等待 Cloudflare Turnstile 验证...")
+    print("[Auth] 等待登录页 Cloudflare Turnstile 验证...")
     start_ts = time.time()
     clicked_times = 0
 
@@ -139,21 +244,10 @@ def wait_and_solve_turnstile(page: Page, max_wait: int = 50) -> bool:
 
         elapsed = time.time() - start_ts
         if elapsed > 8 and clicked_times < 3 and int(elapsed) % 10 < 2:
-            try:
-                iframe_loc = page.locator('iframe[src*="challenges.cloudflare.com"]').first
-                box = iframe_loc.bounding_box(timeout=2000)
-                if box:
-                    target_x = box["x"] + random.uniform(24, 34)
-                    target_y = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
-                    print(f"[Auth] 尝试人工点击 Turnstile ({int(target_x)}, {int(target_y)})")
-                    page.mouse.move(target_x, target_y, steps=random.randint(10, 18))
-                    time.sleep(random.uniform(0.25, 0.55))
-                    page.mouse.click(target_x, target_y)
-                    clicked_times += 1
-                    time.sleep(4)
-                    continue
-            except Exception:
-                pass
+            if _click_turnstile_checkbox(page):
+                clicked_times += 1
+                time.sleep(4)
+                continue
 
         time.sleep(1.5)
 
@@ -164,7 +258,10 @@ def wait_and_solve_turnstile(page: Page, max_wait: int = 50) -> bool:
 def login_play_hosting(page: Page, email: str, password: str) -> None:
     print(f"[Auth] 正在打开登录页: {LOGIN_URL}")
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_selector('input[type="password"]', timeout=30000)
+
+    wait_for_login_form_or_bypass_cf(page, max_wait=65)
+    if "/auth/login" not in page.url:
+        return
 
     email_input = page.locator(
         'input[type="email"], input[name="email"], input[autocomplete="email"]'
@@ -224,7 +321,7 @@ def open_server_page(page: Page, server_id: str) -> str:
                 || text.includes('Online')
                 || text.includes('Starting');
         }""",
-        timeout=30000,
+        timeout=35000,
     )
     time.sleep(3)
     return page.url
@@ -338,6 +435,7 @@ def process_single_account(
     print(f"\n==================== [{index}/{total}] {name} ({masked}) ====================")
 
     proxy = SingBoxProxy(proxy_url, local_port=local_port)
+    user_data_dir = tempfile.mkdtemp(prefix=f"ph_profile_{index}_")
     actions: List[str] = []
     initial_state = "unknown"
     final_state = "unknown"
@@ -349,7 +447,9 @@ def process_single_account(
         viewport = random.choice(VIEWPORT_POOL)
 
         launch_kwargs: Dict[str, Any] = {
+            "user_data_dir": user_data_dir,
             "headless": False,
+            "no_viewport": True,
             "args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -359,13 +459,17 @@ def process_single_account(
         if local_proxy:
             launch_kwargs["proxy"] = {"server": local_proxy}
 
-        browser = playwright_ctx.chromium.launch(**launch_kwargs)
+        # 优先使用真实 Chrome（Patchright 过 Cloudflare 最稳定），未安装时自动回退 Chromium
         try:
-            context = browser.new_context(
-                viewport=viewport,
-                locale="en-US",
+            context = playwright_ctx.chromium.launch_persistent_context(
+                channel="chrome", **launch_kwargs
             )
-            page = context.new_page()
+        except Exception as launch_err:
+            print(f"[Browser] Chrome 启动失败 ({launch_err})，回退至内置 Chromium")
+            context = playwright_ctx.chromium.launch_persistent_context(**launch_kwargs)
+
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(30000)
 
             try:
@@ -411,7 +515,7 @@ def process_single_account(
                     pass
                 raise
         finally:
-            browser.close()
+            context.close()
 
     except Exception as e:
         if not error_msg:
@@ -419,6 +523,7 @@ def process_single_account(
         print(f"[Failed] {name} 任务失败: {error_msg}")
     finally:
         proxy.stop()
+        shutil.rmtree(user_data_dir, ignore_errors=True)
 
     ok = not error_msg and final_state in ("online", "starting")
 
@@ -457,7 +562,7 @@ def process_single_account(
         ]
     )
     if error_msg:
-        lines.append(f"❗ 错误: <code>{escape_html(error_msg[:260])}</code>")
+        lines.append(f"❗ 错误: <code>{escape_html(error_msg[:300])}</code>")
 
     send_telegram_report(
         bot_token=tg_token,
@@ -503,7 +608,6 @@ def main() -> None:
     else:
         print(f"[Init] 共加载 {len(accounts)} 个账号")
 
-    # 开场随机小幅抖动，避免每次在整点同一秒发起请求
     start_jitter = random.uniform(3.0, 12.0)
     print(f"[Init] 随机延迟 {start_jitter:.1f}s 后开始巡检...")
     time.sleep(start_jitter)
@@ -523,7 +627,6 @@ def main() -> None:
             )
             results.append(res)
 
-            # 账号之间的短暂随机空置期（最后一个账号结束后不等待）
             if idx < total:
                 cooldown = random.uniform(delay_min, delay_max)
                 print(
@@ -531,13 +634,12 @@ def main() -> None:
                 )
                 time.sleep(cooldown)
 
-    # 多账号时额外发送一条总览消息，方便一眼确认全部结果
     success_count = sum(1 for r in results if r["ok"])
     fail_count = total - success_count
 
     if total > 1:
         summary_lines = [
-            f"<b>📋 Play.Hosting 多账号巡检汇总</b>",
+            "<b>📋 Play.Hosting 多账号巡检汇总</b>",
             f"🕒 完成时间: <code>{now_cst()}</code>",
             f"📈 结果: 成功 <b>{success_count}</b> / 失败 <b>{fail_count}</b>（共 {total} 个）",
             "",
