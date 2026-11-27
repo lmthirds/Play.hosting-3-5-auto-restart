@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from patchright.sync_api import Page, sync_playwright
+from seleniumbase import SB
 
 from proxy_manager import SingBoxProxy
 from telegram_notify import escape_html, send_telegram_report, send_telegram_text
@@ -113,89 +113,63 @@ def load_accounts() -> List[Dict[str, str]]:
     raise ValueError("未配置 ACCOUNTS_JSON（或单账号 PLAY_EMAIL / PLAY_PASSWORD）")
 
 
-def is_visible(page: Page, selector: str, timeout: int = 1200) -> bool:
+def get_body_text(sb: Any) -> str:
     try:
-        loc = page.locator(selector).first
-        loc.wait_for(state="visible", timeout=timeout)
-        return True
+        return sb.get_text("body") or ""
     except Exception:
-        return False
+        return ""
 
 
-def _click_turnstile_checkbox(page: Page) -> bool:
-    # 方式 1：直接匹配 Cloudflare Turnstile iframe
-    iframe_selectors = [
-        'iframe[src*="challenges.cloudflare.com"]',
-        'iframe[title*="Cloudflare"]',
-        'iframe[title*="challenge"]',
-    ]
-    for sel in iframe_selectors:
-        try:
-            box = page.locator(sel).first.bounding_box(timeout=1500)
-            if box and box["width"] > 20 and box["height"] > 20:
-                tx = box["x"] + random.uniform(24, 34)
-                ty = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
-                print(f"[Auth] 点击 Turnstile iframe ({int(tx)}, {int(ty)})")
-                page.mouse.move(tx, ty, steps=random.randint(10, 18))
-                time.sleep(random.uniform(0.25, 0.5))
-                page.mouse.click(tx, ty)
-                return True
-        except Exception:
-            continue
-
-    # 方式 2：兼容 Closed Shadow DOM（通过 cf-turnstile-response 父容器定位点击）
+def get_turnstile_token(sb: Any) -> str:
     try:
-        box = page.evaluate(
-            """() => {
-                const inp = document.querySelector('input[name="cf-turnstile-response"]');
-                if (!inp) return null;
-                let el = inp.parentElement;
-                while (el && el !== document.body) {
-                    const r = el.getBoundingClientRect();
-                    if (r.width >= 150 && r.height >= 45 && r.height <= 140) {
-                        return { x: r.left, y: r.top, width: r.width, height: r.height };
-                    }
-                    el = el.parentElement;
-                }
-                return null;
-            }"""
+        token = sb.execute_script(
+            """
+            const el = document.querySelector('input[name="cf-turnstile-response"]');
+            return el ? el.value : '';
+            """
         )
-        if box:
-            tx = box["x"] + random.uniform(24, 34)
-            ty = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
-            print(f"[Auth] 点击 Turnstile 容器 ({int(tx)}, {int(ty)})")
-            page.mouse.move(tx, ty, steps=random.randint(10, 18))
-            time.sleep(random.uniform(0.25, 0.5))
-            page.mouse.click(tx, ty)
-            return True
+        return str(token or "")
     except Exception:
-        pass
-
-    return False
+        return ""
 
 
-def wait_for_login_form_or_bypass_cf(page: Page, max_wait: int = 65) -> None:
-    print("[Auth] 等待登录表单渲染（自动兼容 Cloudflare 全屏盾）...")
+def try_uc_gui_click(sb: Any) -> None:
+    try:
+        print("[Auth] 执行系统级 GUI 点击 Cloudflare 验证框...")
+        sb.uc_gui_click_captcha()
+    except Exception as e:
+        print(f"[Auth] GUI 点击尝试返回异常（可忽略）: {e}")
+
+
+def wait_for_login_form_or_bypass_cf(sb: Any, max_wait: int = 75) -> None:
+    print("[Auth] 等待登录表单加载（UC 模式自动过 Cloudflare 全屏盾）...")
     start_ts = time.time()
     last_title = ""
     clicked_times = 0
+    last_click_ts = 0.0
 
     while time.time() - start_ts < max_wait:
-        if is_visible(page, 'input[type="password"]', timeout=1000):
+        if sb.is_element_visible('input[type="password"]'):
             print("[Auth] 登录表单已加载完成")
             return
 
-        if "/server/" in page.url:
+        current_url = ""
+        try:
+            current_url = sb.get_current_url() or ""
+        except Exception:
+            pass
+
+        if "/server/" in current_url:
             print("[Auth] 页面已直接跳转至服务器面板")
             return
 
         try:
-            title = page.title() or ""
+            title = sb.get_title() or ""
         except Exception:
             title = ""
 
         if title != last_title:
-            print(f"[Auth] 当前页面标题: {title!r} | URL: {page.url}")
+            print(f"[Auth] 当前页面标题: {title!r} | URL: {current_url}")
             last_title = title
 
         elapsed = time.time() - start_ts
@@ -205,199 +179,205 @@ def wait_for_login_form_or_bypass_cf(page: Page, max_wait: int = 65) -> None:
             for kw in ("just a moment", "attention required", "cloudflare", "请稍候", "verify")
         )
 
-        # 全屏人机盾超过 6 秒未自动放行时，尝试模拟人工点击验证框
-        if elapsed > 6 and clicked_times < 4 and (is_cf_shield or int(elapsed) % 10 < 2):
-            if _click_turnstile_checkbox(page):
-                clicked_times += 1
-                time.sleep(5)
-                continue
+        # 全屏盾出现时，调用系统级鼠标点击，每次间隔至少 12 秒
+        if (
+            is_cf_shield
+            and clicked_times < 4
+            and elapsed > 4
+            and (time.time() - last_click_ts >= 12)
+        ):
+            try_uc_gui_click(sb)
+            clicked_times += 1
+            last_click_ts = time.time()
+            sb.sleep(5)
+            continue
 
-        time.sleep(1.5)
+        sb.sleep(2)
 
-    # 超时前打印诊断信息，便于直接从日志判断卡点
-    snippet = ""
-    try:
-        snippet = (page.locator("body").inner_text(timeout=3000) or "").strip()
-        snippet = re.sub(r"\s+", " ", snippet)[:200]
-    except Exception:
-        pass
+    snippet = re.sub(r"\s+", " ", get_body_text(sb).strip())[:200]
     raise RuntimeError(
-        f"等待登录表单超时({max_wait}s) | Title: {last_title!r} | URL: {page.url} | 页面文本: {snippet}"
+        f"等待登录表单超时({max_wait}s) | Title: {last_title!r} | 页面文本: {snippet}"
     )
 
 
-def wait_and_solve_turnstile(page: Page, max_wait: int = 50) -> bool:
+def wait_and_solve_login_turnstile(sb: Any, max_wait: int = 50) -> bool:
     print("[Auth] 等待登录页 Cloudflare Turnstile 验证...")
     start_ts = time.time()
     clicked_times = 0
+    last_click_ts = 0.0
 
     while time.time() - start_ts < max_wait:
-        token = page.evaluate(
-            """() => {
-                const el = document.querySelector('input[name="cf-turnstile-response"]');
-                return el ? el.value : '';
-            }"""
-        )
-        if token and len(token) > 10:
-            print("[Auth] Turnstile 验证已通过")
+        token = get_turnstile_token(sb)
+        if len(token) > 10:
+            print("[Auth] 登录页 Turnstile 验证已通过")
             return True
 
         elapsed = time.time() - start_ts
-        if elapsed > 8 and clicked_times < 3 and int(elapsed) % 10 < 2:
-            if _click_turnstile_checkbox(page):
-                clicked_times += 1
-                time.sleep(4)
-                continue
+        if elapsed > 6 and clicked_times < 3 and (time.time() - last_click_ts >= 12):
+            try_uc_gui_click(sb)
+            clicked_times += 1
+            last_click_ts = time.time()
+            sb.sleep(5)
+            continue
 
-        time.sleep(1.5)
+        sb.sleep(2)
 
-    print("[Auth] Turnstile 等待超时，仍将尝试提交登录")
+    print("[Auth] 登录页 Turnstile 等待超时，仍将尝试提交登录")
     return False
 
 
-def login_play_hosting(page: Page, email: str, password: str) -> None:
-    print(f"[Auth] 正在打开登录页: {LOGIN_URL}")
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+def login_play_hosting(sb: Any, email: str, password: str) -> None:
+    print(f"[Auth] 正在以 UC 断连模式打开登录页: {LOGIN_URL}")
+    sb.uc_open_with_reconnect(LOGIN_URL, 6)
 
-    wait_for_login_form_or_bypass_cf(page, max_wait=65)
-    if "/auth/login" not in page.url:
+    wait_for_login_form_or_bypass_cf(sb, max_wait=75)
+    if "/auth/login" not in (sb.get_current_url() or ""):
         return
 
-    email_input = page.locator(
-        'input[type="email"], input[name="email"], input[autocomplete="email"]'
-    ).first
-    pass_input = page.locator('input[type="password"]').first
+    email_sel = 'input[type="email"], input[name="email"], input[autocomplete="email"]'
+    pass_sel = 'input[type="password"]'
 
-    email_input.click()
-    time.sleep(random.uniform(0.2, 0.5))
-    email_input.fill(email)
-    time.sleep(random.uniform(0.4, 0.9))
+    sb.click(email_sel)
+    sb.sleep(random.uniform(0.2, 0.5))
+    sb.type(email_sel, email)
+    sb.sleep(random.uniform(0.4, 0.9))
 
-    pass_input.click()
-    time.sleep(random.uniform(0.2, 0.5))
-    pass_input.fill(password)
-    time.sleep(random.uniform(0.5, 1.0))
+    sb.click(pass_sel)
+    sb.sleep(random.uniform(0.2, 0.5))
+    sb.type(pass_sel, password)
+    sb.sleep(random.uniform(0.5, 1.0))
 
-    wait_and_solve_turnstile(page, max_wait=50)
+    wait_and_solve_login_turnstile(sb, max_wait=50)
 
-    login_btn = page.locator('button[type="submit"], button:has-text("Log in")').first
-    login_btn.click()
+    login_btn_xpath = '//button[@type="submit" or contains(normalize-space(.), "Log in")]'
+    sb.click(login_btn_xpath)
     print("[Auth] 已点击 Log in，等待登录跳转...")
 
     deadline = time.time() + 35
     while time.time() < deadline:
-        if "/auth/login" not in page.url:
-            print(f"[Auth] 登录成功，当前页面: {page.url}")
-            time.sleep(random.uniform(2.0, 3.5))
+        cur_url = sb.get_current_url() or ""
+        if "/auth/login" not in cur_url:
+            print(f"[Auth] 登录成功，当前页面: {cur_url}")
+            sb.sleep(random.uniform(2.0, 3.5))
             return
-        time.sleep(1)
+        sb.sleep(1.5)
 
     raise RuntimeError("登录超时或失败（可能账号密码错误或未通过 Cloudflare 验证）")
 
 
-def open_server_page(page: Page, server_id: str) -> str:
+def open_server_page(sb: Any, server_id: str) -> str:
+    cur_url = sb.get_current_url() or ""
     if server_id:
         target_url = (
             server_id
             if server_id.startswith("http")
             else f"https://panel.play.hosting/server/{server_id.strip('/')}"
         )
-        if target_url not in page.url:
+        if target_url not in cur_url:
             print(f"[Panel] 跳转到服务器页面: {target_url}")
-            page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-    elif "/server/" not in page.url:
+            sb.uc_open_with_reconnect(target_url, 4)
+    elif "/server/" not in cur_url:
         print("[Panel] 未指定 server_id，尝试自动打开第一个服务器...")
-        first_srv = page.locator('a[href*="/server/"]').first
-        first_srv.wait_for(state="visible", timeout=20000)
-        first_srv.click()
+        sb.wait_for_element_visible('a[href*="/server/"]', timeout=20)
+        sb.click('a[href*="/server/"]')
 
-    page.wait_for_function(
-        """() => {
-            const text = document.body ? document.body.innerText : '';
-            return text.includes('Server in limbo')
-                || text.includes('Restoring server')
-                || text.includes('Connect with')
-                || text.includes('Offline')
-                || text.includes('Online')
-                || text.includes('Starting');
-        }""",
-        timeout=35000,
+    # 等待面板核心状态文案渲染
+    deadline = time.time() + 40
+    keywords = (
+        "Server in limbo",
+        "Restoring server",
+        "Connect with",
+        "Offline",
+        "Online",
+        "Starting",
     )
-    time.sleep(3)
-    return page.url
+    while time.time() < deadline:
+        text = get_body_text(sb)
+        if any(k in text for k in keywords):
+            break
+        sb.sleep(1.5)
+
+    sb.sleep(3)
+    return sb.get_current_url() or ""
 
 
-def detect_server_state(page: Page) -> str:
-    if is_visible(page, 'text="Server in limbo"', 1000) or is_visible(
-        page, 'button:has-text("Wake server")', 800
+def detect_server_state(sb: Any) -> str:
+    if sb.is_element_visible('//*[contains(text(), "Server in limbo")]') or sb.is_element_visible(
+        '//button[contains(., "Wake server")]'
     ):
         return "limbo"
 
-    if is_visible(page, 'text="Restoring server"', 1000) or is_visible(
-        page, 'text="Resuming your server"', 800
+    if sb.is_element_visible('//*[contains(text(), "Restoring server")]') or sb.is_element_visible(
+        '//*[contains(text(), "Resuming your server")]'
     ):
         return "restoring"
 
-    has_stop = is_visible(page, 'button:has-text("Stop")', 1000)
-    has_restart = is_visible(page, 'button:has-text("Restart")', 800)
+    has_stop = sb.is_element_visible('//button[contains(., "Stop")]')
+    has_restart = sb.is_element_visible('//button[contains(., "Restart")]')
     if has_stop or has_restart:
-        body_text = page.locator("body").inner_text()
+        body_text = get_body_text(sb)
         if "Starting" in body_text and "Online" not in body_text:
             return "starting"
         return "online"
 
     if (
-        is_visible(page, 'text="Your server is offline"', 1000)
-        or is_visible(page, 'button:has-text("Start server")', 800)
-        or is_visible(page, 'button:has-text("Start")', 800)
+        sb.is_element_visible('//*[contains(text(), "Your server is offline")]')
+        or sb.is_element_visible('//button[contains(., "Start server")]')
+        or sb.is_element_visible('//button[contains(., "Start")]')
     ):
         return "offline"
 
     return "unknown"
 
 
-def click_start_button(page: Page) -> None:
+def click_start_button(sb: Any) -> None:
     candidates = [
-        'header button:has-text("Start")',
-        'button:has-text("Start"):not(:has-text("Start server"))',
-        'button:has-text("Start server")',
+        '//header//button[contains(., "Start")]',
+        '//button[contains(., "Start") and not(contains(., "Start server"))]',
+        '//button[contains(., "Start server")]',
+        '//button[contains(., "Start")]',
     ]
-    for sel in candidates:
-        loc = page.locator(sel).first
+    for xpath in candidates:
         try:
-            if loc.is_visible(timeout=1500) and loc.is_enabled(timeout=1500):
-                loc.scroll_into_view_if_needed()
-                loc.click(timeout=5000)
-                print(f"[Action] 已点击开机按钮: {sel}")
+            if sb.is_element_visible(xpath):
+                sb.scroll_to(xpath)
+                sb.click(xpath)
+                print(f"[Action] 已点击开机按钮: {xpath}")
                 return
         except Exception:
             continue
 
-    fallback = page.locator('button:has-text("Start")').first
-    fallback.click(force=True, timeout=5000)
-    print("[Action] 已强制点击 Start 按钮")
+    # 兜底 JS 点击
+    sb.execute_script(
+        """
+        const btns = Array.from(document.querySelectorAll('button'));
+        const target = btns.find(b => (b.innerText || '').includes('Start') && !b.disabled);
+        if (target) target.click();
+        """
+    )
+    print("[Action] 已通过 JS 兜底点击 Start 按钮")
 
 
-def wait_for_restore_complete(page: Page, max_wait: int = 240) -> str:
+def wait_for_restore_complete(sb: Any, max_wait: int = 240) -> str:
     print("[Action] 等待服务器从 Limbo 恢复（最长 4 分钟）...")
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        state = detect_server_state(page)
+        state = detect_server_state(sb)
         print(f"[Action] 恢复检查当前状态: {state}")
         if state not in ("limbo", "restoring"):
             return state
-        time.sleep(6)
-    return detect_server_state(page)
+        sb.sleep(6)
+    return detect_server_state(sb)
 
 
-def wait_for_boot(page: Page, max_wait: int = 120) -> str:
+def wait_for_boot(sb: Any, max_wait: int = 120) -> str:
     print("[Action] 等待服务器启动（最长 2 分钟）...")
     deadline = time.time() + max_wait
     reached_starting = False
     starting_since: Optional[float] = None
 
     while time.time() < deadline:
-        state = detect_server_state(page)
+        state = detect_server_state(sb)
         print(f"[Action] 开机检查当前状态: {state}")
         if state == "online":
             return "online"
@@ -407,13 +387,12 @@ def wait_for_boot(page: Page, max_wait: int = 120) -> str:
                 starting_since = time.time()
             elif starting_since and time.time() - starting_since >= 35:
                 return "starting"
-        time.sleep(5)
+        sb.sleep(5)
 
-    return detect_server_state(page)
+    return detect_server_state(sb)
 
 
 def process_single_account(
-    playwright_ctx: Any,
     account: Dict[str, str],
     index: int,
     total: int,
@@ -435,7 +414,7 @@ def process_single_account(
     print(f"\n==================== [{index}/{total}] {name} ({masked}) ====================")
 
     proxy = SingBoxProxy(proxy_url, local_port=local_port)
-    user_data_dir = tempfile.mkdtemp(prefix=f"ph_profile_{index}_")
+    user_data_dir = tempfile.mkdtemp(prefix=f"ph_uc_profile_{index}_")
     actions: List[str] = []
     initial_state = "unknown"
     final_state = "unknown"
@@ -444,80 +423,63 @@ def process_single_account(
 
     try:
         local_proxy = proxy.start()
+        sb_proxy = (
+            local_proxy.replace("http://", "").replace("https://", "")
+            if local_proxy
+            else None
+        )
         viewport = random.choice(VIEWPORT_POOL)
 
-        launch_kwargs: Dict[str, Any] = {
-            "user_data_dir": user_data_dir,
-            "headless": False,
-            "no_viewport": True,
-            "locale": "en-US",
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--lang=en-US",
-                f"--window-size={viewport['width']},{viewport['height']}",
-            ],
-        }
-        if local_proxy:
-            launch_kwargs["proxy"] = {"server": local_proxy}
-
-        # 优先使用真实 Chrome（Patchright 过 Cloudflare 最稳定），未安装时自动回退 Chromium
-        try:
-            context = playwright_ctx.chromium.launch_persistent_context(
-                channel="chrome", **launch_kwargs
-            )
-        except Exception as launch_err:
-            print(f"[Browser] Chrome 启动失败 ({launch_err})，回退至内置 Chromium")
-            context = playwright_ctx.chromium.launch_persistent_context(**launch_kwargs)
-
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(30000)
+        with SB(
+            uc=True,
+            headless=False,
+            proxy=sb_proxy,
+            user_data_dir=user_data_dir,
+            locale_code="en",
+        ) as sb:
+            sb.set_window_size(viewport["width"], viewport["height"])
 
             try:
-                login_play_hosting(page, email, password)
-                current_url = open_server_page(page, server_id)
+                login_play_hosting(sb, email, password)
+                current_url = open_server_page(sb, server_id)
 
-                initial_state = detect_server_state(page)
+                initial_state = detect_server_state(sb)
                 print(f"[Status] 初始服务器状态: {initial_state}")
                 state = initial_state
 
                 if state == "limbo":
-                    wake_btn = page.locator('button:has-text("Wake server")').first
-                    wake_btn.click()
+                    sb.click('//button[contains(., "Wake server")]')
                     actions.append("点击 Wake server 唤醒")
-                    time.sleep(3)
-                    state = wait_for_restore_complete(page)
+                    sb.sleep(3)
+                    state = wait_for_restore_complete(sb)
                 elif state == "restoring":
                     actions.append("等待服务器恢复完成")
-                    state = wait_for_restore_complete(page)
+                    state = wait_for_restore_complete(sb)
 
                 if state == "offline":
-                    click_start_button(page)
+                    click_start_button(sb)
                     actions.append("点击 Start 开机")
-                    time.sleep(4)
-                    state = wait_for_boot(page)
+                    sb.sleep(4)
+                    state = wait_for_boot(sb)
                 elif state == "starting":
                     actions.append("等待启动完成")
-                    state = wait_for_boot(page, max_wait=60)
+                    state = wait_for_boot(sb, max_wait=60)
                 elif state == "online":
                     actions.append("运行正常，无需操作")
 
                 final_state = state
-                time.sleep(2)
-                page.screenshot(path=screenshot_path, full_page=False)
+                sb.sleep(2)
+                sb.save_screenshot(screenshot_path)
                 print(f"[Done] {name} 最终状态: {final_state}，截图: {screenshot_path}")
 
             except Exception as e:
                 error_msg = str(e)
                 print(f"[Error] {name} 执行异常: {error_msg}")
                 try:
-                    page.screenshot(path=screenshot_path, full_page=False)
+                    sb.save_screenshot(screenshot_path)
                 except Exception:
                     pass
                 raise
-        finally:
-            context.close()
 
     except Exception as e:
         if not error_msg:
@@ -617,24 +579,22 @@ def main() -> None:
     results: List[Dict[str, Any]] = []
     total = len(accounts)
 
-    with sync_playwright() as p:
-        for idx, account in enumerate(accounts, start=1):
-            res = process_single_account(
-                playwright_ctx=p,
-                account=account,
-                index=idx,
-                total=total,
-                tg_token=tg_token,
-                tg_chat_id=tg_chat_id,
-            )
-            results.append(res)
+    for idx, account in enumerate(accounts, start=1):
+        res = process_single_account(
+            account=account,
+            index=idx,
+            total=total,
+            tg_token=tg_token,
+            tg_chat_id=tg_chat_id,
+        )
+        results.append(res)
 
-            if idx < total:
-                cooldown = random.uniform(delay_min, delay_max)
-                print(
-                    f"[Cooldown] 账号 {account['name']} 处理完毕，空置冷却 {cooldown:.1f}s 后继续下一个账号..."
-                )
-                time.sleep(cooldown)
+        if idx < total:
+            cooldown = random.uniform(delay_min, delay_max)
+            print(
+                f"[Cooldown] 账号 {account['name']} 处理完毕，空置冷却 {cooldown:.1f}s 后继续下一个账号..."
+            )
+            time.sleep(cooldown)
 
     success_count = sum(1 for r in results if r["ok"])
     fail_count = total - success_count
