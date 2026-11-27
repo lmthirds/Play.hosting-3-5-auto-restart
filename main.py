@@ -129,6 +129,14 @@ def get_body_text(sb: Any) -> str:
     return str(text or "")
 
 
+def get_input_value(sb: Any, css_selector: str) -> str:
+    js = f"""(() => {{
+        const el = document.querySelector({json.dumps(css_selector)});
+        return el ? (el.value || '') : '';
+    }})()"""
+    return str(cdp_eval(sb, js, "") or "")
+
+
 def is_css_visible(sb: Any, css_selector: str) -> bool:
     js = f"""(() => {{
         const el = document.querySelector({json.dumps(css_selector)});
@@ -211,6 +219,55 @@ def dismiss_consent_modal(sb: Any) -> bool:
         sb.sleep(1.5)
         return True
     return False
+
+
+def fill_input_verified(sb: Any, css_selector: str, value: str, label: str) -> None:
+    """输入文本并校验实际写入值，防止被延迟弹出的 GDPR 弹窗遮挡导致漏填"""
+    for attempt in range(1, 4):
+        dismiss_consent_modal(sb)
+        try:
+            sb.cdp.click(css_selector)
+            sb.sleep(random.uniform(0.2, 0.4))
+            cdp_eval(
+                sb,
+                f"""(() => {{
+                    const el = document.querySelector({json.dumps(css_selector)});
+                    if (el) {{
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(el, '');
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        el.focus();
+                    }}
+                }})()""",
+                None,
+            )
+            sb.cdp.type(css_selector, value)
+            sb.sleep(random.uniform(0.3, 0.6))
+        except Exception as e:
+            print(f"[Auth] 第 {attempt} 次填写 {label} 异常: {e}")
+
+        if get_input_value(sb, css_selector) == value:
+            return
+
+        print(f"[Auth] 第 {attempt} 次填写 {label} 未生效（可能被弹窗遮挡），清理弹窗后重试...")
+        dismiss_consent_modal(sb)
+        sb.sleep(0.8)
+
+    # 兜底通过原生 setter 写入并触发 React input/change 事件
+    cdp_eval(
+        sb,
+        f"""(() => {{
+            const el = document.querySelector({json.dumps(css_selector)});
+            if (el) {{
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, {json.dumps(value)});
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }}
+        }})()""",
+        None,
+    )
+    sb.sleep(0.4)
 
 
 def click_button_by_text(
@@ -479,27 +536,26 @@ def login_play_hosting(sb: Any, email: str, password: str) -> None:
     if "/auth/login" not in (sb.cdp.get_current_url() or ""):
         return
 
-    sb.sleep(1.5)
+    sb.sleep(2.0)
     dismiss_consent_modal(sb)
 
     email_sel = 'input[type="email"], input[name="email"], input[autocomplete="email"]'
     pass_sel = 'input[type="password"]'
 
-    sb.cdp.click(email_sel)
-    sb.sleep(random.uniform(0.2, 0.5))
-    sb.cdp.type(email_sel, email)
-    sb.sleep(random.uniform(0.4, 0.9))
-
-    dismiss_consent_modal(sb)
-
-    sb.cdp.click(pass_sel)
-    sb.sleep(random.uniform(0.2, 0.5))
-    sb.cdp.type(pass_sel, password)
+    fill_input_verified(sb, email_sel, email, "邮箱")
+    sb.sleep(random.uniform(0.3, 0.7))
+    fill_input_verified(sb, pass_sel, password, "密码")
     sb.sleep(random.uniform(0.5, 1.0))
 
     wait_and_solve_login_turnstile(sb, max_wait=55)
 
+    # 提交前再复核一次邮箱和密码，确保未被弹窗或刷新清空
     dismiss_consent_modal(sb)
+    if get_input_value(sb, email_sel) != email:
+        fill_input_verified(sb, email_sel, email, "邮箱")
+    if get_input_value(sb, pass_sel) != password:
+        fill_input_verified(sb, pass_sel, password, "密码")
+
     if not click_button_by_text(sb, "Log in", require_ready=False):
         sb.cdp.click('button[type="submit"]')
     print("[Auth] 已点击 Log in，等待登录跳转...")
@@ -561,14 +617,12 @@ def open_server_page(sb: Any, server_id: str) -> str:
 def detect_server_state(sb: Any) -> str:
     body_text = get_body_text(sb)
 
-    # 1. 优先判断 Limbo 休眠与恢复态
     if "Server in limbo" in body_text or is_button_text_visible(sb, "Wake server"):
         return "limbo"
 
     if "Restoring server" in body_text or "Resuming your server" in body_text:
         return "restoring"
 
-    # 2. 精准读取顶部状态栏胶囊（避免整页文本误判）
     badge = get_top_status_badge(sb)
     if badge == "online":
         return "online"
@@ -577,7 +631,6 @@ def detect_server_state(sb: Any) -> str:
     if badge in ("offline", "stopping"):
         return "offline"
 
-    # 3. 兜底根据按钮和 Uptime 文案判断
     has_stop = is_button_text_visible(sb, "Stop")
     has_restart = is_button_text_visible(sb, "Restart")
     if has_stop or has_restart:
@@ -660,7 +713,6 @@ def wait_for_boot(sb: Any, max_wait: int = 120) -> str:
         print(f"[Action] 开机检查当前状态: {state}")
 
         if state == "online":
-            # 额外确认 5 秒，避免刚显示 Online 就被 Limbo 回收
             sb.sleep(5)
             confirm_state = detect_server_state(sb)
             print(f"[Action] 5s 后复核状态: {confirm_state}")
@@ -755,7 +807,6 @@ def process_single_account(
                 print(f"[Status] 初始服务器状态: {initial_state}")
                 state = initial_state
 
-                # 最多尝试 2 轮唤醒+开机（防止开机瞬间撞上 0s Limbo 倒计时被踢回休眠）
                 for attempt in range(1, 3):
                     if state == "limbo":
                         if not click_button_by_text(sb, "Wake server"):
