@@ -33,15 +33,13 @@ jobs:
           sudo chmod +x /usr/local/bin/sing-box
           sing-box version
 
-      - name: Install dependencies and Chrome
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb xauth python3-tk python3-dev scrot
           pip install --upgrade pip
           pip install -r requirements.txt
-          patchright install chrome || true
-          patchright install chromium
-          patchright install-deps chromium
+          google-chrome --version
 
       - name: Run Play.Hosting Multi-Account Keeper
         env:
@@ -53,6 +51,7 @@ jobs:
           ACCOUNT_DELAY_MAX: "40"
           SHUFFLE_ACCOUNTS: "true"
         run: |
+          touch ~/.Xauthority
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python main.py
 
       - name: Upload result screenshots
