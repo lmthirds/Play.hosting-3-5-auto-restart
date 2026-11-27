@@ -143,7 +143,7 @@ def _click_turnstile_checkbox(page: Page) -> bool:
         except Exception:
             continue
 
-    # 方式 2：兼容 Closed Shadow DOM（通过 cf-turnstile-response 父容器坐标点击）
+    # 方式 2：兼容 Closed Shadow DOM（通过 cf-turnstile-response 父容器定位点击）
     try:
         box = page.evaluate(
             """() => {
@@ -214,7 +214,7 @@ def wait_for_login_form_or_bypass_cf(page: Page, max_wait: int = 65) -> None:
 
         time.sleep(1.5)
 
-    # 超时前打印诊断信息，方便在日志中直接判断原因
+    # 超时前打印诊断信息，便于直接从日志判断卡点
     snippet = ""
     try:
         snippet = (page.locator("body").inner_text(timeout=3000) or "").strip()
@@ -450,9 +450,11 @@ def process_single_account(
             "user_data_dir": user_data_dir,
             "headless": False,
             "no_viewport": True,
+            "locale": "en-US",
             "args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--lang=en-US",
                 f"--window-size={viewport['width']},{viewport['height']}",
             ],
         }
