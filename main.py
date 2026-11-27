@@ -155,6 +155,23 @@ def is_button_text_visible(sb: Any, text: str) -> bool:
     return bool(cdp_eval(sb, js, False))
 
 
+def get_top_status_badge(sb: Any) -> str:
+    """精准读取顶部状态栏胶囊文案（Online / Starting / Offline / Stopping）"""
+    js = """(() => {
+        const els = Array.from(document.querySelectorAll('span, div, p'));
+        for (const el of els) {
+            const r = el.getBoundingClientRect();
+            if (r.top < 0 || r.top > 120 || r.width <= 0 || r.height <= 0 || r.width > 200) continue;
+            const t = (el.innerText || '').trim();
+            if (t === 'Online' || t === 'Starting' || t === 'Offline' || t === 'Stopping') {
+                return t.toLowerCase();
+            }
+        }
+        return '';
+    })()"""
+    return str(cdp_eval(sb, js, "") or "")
+
+
 def dismiss_consent_modal(sb: Any) -> bool:
     """自动关闭欧洲节点触发的 GDPR / Google 隐私同意弹窗"""
     js = """(() => {
@@ -432,7 +449,6 @@ def wait_and_solve_login_turnstile(sb: Any, max_wait: int = 55) -> bool:
     last_click_ts = 0.0
 
     while time.time() - start_ts < max_wait:
-        # 防止 GDPR 隐私弹窗延迟弹出遮挡验证框
         dismiss_consent_modal(sb)
 
         token = get_turnstile_token(sb)
@@ -463,7 +479,6 @@ def login_play_hosting(sb: Any, email: str, password: str) -> None:
     if "/auth/login" not in (sb.cdp.get_current_url() or ""):
         return
 
-    # 进入登录页后先等待并清理可能出现的 GDPR 弹窗
     sb.sleep(1.5)
     dismiss_consent_modal(sb)
 
@@ -546,16 +561,27 @@ def open_server_page(sb: Any, server_id: str) -> str:
 def detect_server_state(sb: Any) -> str:
     body_text = get_body_text(sb)
 
+    # 1. 优先判断 Limbo 休眠与恢复态
     if "Server in limbo" in body_text or is_button_text_visible(sb, "Wake server"):
         return "limbo"
 
     if "Restoring server" in body_text or "Resuming your server" in body_text:
         return "restoring"
 
+    # 2. 精准读取顶部状态栏胶囊（避免整页文本误判）
+    badge = get_top_status_badge(sb)
+    if badge == "online":
+        return "online"
+    if badge == "starting":
+        return "starting"
+    if badge in ("offline", "stopping"):
+        return "offline"
+
+    # 3. 兜底根据按钮和 Uptime 文案判断
     has_stop = is_button_text_visible(sb, "Stop")
     has_restart = is_button_text_visible(sb, "Restart")
     if has_stop or has_restart:
-        if "Starting" in body_text and "Online" not in body_text:
+        if "Starting for " in body_text or "Pre-start tasks" in body_text:
             return "starting"
         return "online"
 
@@ -578,10 +604,12 @@ def click_start_button(sb: Any, max_wait: int = 45) -> None:
     while time.time() < deadline:
         dismiss_consent_modal(sb)
 
-        # 若服务器已自动进入启动/在线态，无需再点
         cur_state = detect_server_state(sb)
         if cur_state in ("starting", "online"):
-            print(f"[Action] 服务器已自动变为 {cur_state}，跳过点击 Start")
+            print(f"[Action] 服务器已变为 {cur_state}，跳过点击 Start")
+            return
+        if cur_state in ("limbo", "restoring"):
+            print(f"[Action] 等待 Start 期间服务器进入 {cur_state}，交由外层重新唤醒")
             return
 
         if click_button_by_text(sb, "Start", in_header_only=True, require_ready=True):
@@ -602,7 +630,6 @@ def click_start_button(sb: Any, max_wait: int = 45) -> None:
             logged_waiting = True
         sb.sleep(2.5)
 
-    # 超时前最后尝试强制点击一次
     if click_button_by_text(sb, "Start", require_ready=False):
         print("[Action] 等待超时，已尝试兜底点击 Start 按钮")
         return
@@ -623,32 +650,36 @@ def wait_for_restore_complete(sb: Any, max_wait: int = 240) -> str:
 
 
 def wait_for_boot(sb: Any, max_wait: int = 120) -> str:
-    print("[Action] 等待服务器启动（最长 2 分钟）...")
+    print(f"[Action] 等待服务器完成启动变为 Online（最长 {max_wait}s）...")
     deadline = time.time() + max_wait
-    reached_starting = False
-    starting_since: Optional[float] = None
     retried_start = False
     start_ts = time.time()
 
     while time.time() < deadline:
         state = detect_server_state(sb)
         print(f"[Action] 开机检查当前状态: {state}")
+
         if state == "online":
-            return "online"
-        if state == "starting":
-            if not reached_starting:
-                reached_starting = True
-                starting_since = time.time()
-            elif starting_since and time.time() - starting_since >= 35:
-                return "starting"
-        elif state == "offline" and not retried_start and (time.time() - start_ts >= 12):
-            # 若第一次点击刚好撞上面板重连未生效，补点一次
-            print("[Action] 12 秒后仍为 offline，补点一次 Start 按钮...")
+            # 额外确认 5 秒，避免刚显示 Online 就被 Limbo 回收
+            sb.sleep(5)
+            confirm_state = detect_server_state(sb)
+            print(f"[Action] 5s 后复核状态: {confirm_state}")
+            if confirm_state == "online":
+                return "online"
+            state = confirm_state
+
+        if state in ("limbo", "restoring"):
+            print(f"[Action] 启动过程中检测到服务器掉回 {state}！")
+            return state
+
+        if state == "offline" and not retried_start and (time.time() - start_ts >= 15):
+            print("[Action] 15 秒后仍为 offline，补点一次 Start 按钮...")
             retried_start = True
             try:
                 click_start_button(sb, max_wait=20)
             except Exception as e:
                 print(f"[Action] 补点 Start 失败: {e}")
+
         sb.sleep(5)
 
     return detect_server_state(sb)
@@ -724,26 +755,43 @@ def process_single_account(
                 print(f"[Status] 初始服务器状态: {initial_state}")
                 state = initial_state
 
-                if state == "limbo":
-                    if not click_button_by_text(sb, "Wake server"):
-                        raise RuntimeError("检测到 Limbo 状态，但未找到 Wake server 按钮")
-                    actions.append("点击 Wake server 唤醒")
-                    sb.sleep(3)
-                    state = wait_for_restore_complete(sb)
-                elif state == "restoring":
-                    actions.append("等待服务器恢复完成")
-                    state = wait_for_restore_complete(sb)
+                # 最多尝试 2 轮唤醒+开机（防止开机瞬间撞上 0s Limbo 倒计时被踢回休眠）
+                for attempt in range(1, 3):
+                    if state == "limbo":
+                        if not click_button_by_text(sb, "Wake server"):
+                            raise RuntimeError("检测到 Limbo 状态，但未找到 Wake server 按钮")
+                        actions.append(
+                            "点击 Wake server 唤醒" if attempt == 1 else "掉回休眠，重新唤醒"
+                        )
+                        sb.sleep(3)
+                        state = wait_for_restore_complete(sb)
+                    elif state == "restoring":
+                        actions.append("等待服务器恢复完成")
+                        state = wait_for_restore_complete(sb)
 
-                if state == "offline":
-                    click_start_button(sb, max_wait=45)
-                    actions.append("点击 Start 开机")
-                    sb.sleep(4)
-                    state = wait_for_boot(sb)
-                elif state == "starting":
-                    actions.append("等待启动完成")
-                    state = wait_for_boot(sb, max_wait=60)
-                elif state == "online":
-                    actions.append("运行正常，无需操作")
+                    if state == "offline":
+                        click_start_button(sb, max_wait=45)
+                        state = detect_server_state(sb)
+                        if state in ("limbo", "restoring"):
+                            continue
+                        actions.append("点击 Start 开机")
+                        sb.sleep(4)
+                        state = wait_for_boot(sb, max_wait=120)
+                    elif state == "starting":
+                        if attempt == 1:
+                            actions.append("等待启动完成")
+                        state = wait_for_boot(sb, max_wait=120)
+                    elif state == "online":
+                        if attempt == 1:
+                            actions.append("运行正常，无需操作")
+                        break
+
+                    if state in ("online", "starting"):
+                        break
+                    if state in ("limbo", "restoring") and attempt == 1:
+                        print("[Action] 检测到服务器被踢回休眠，开始第 2 轮自动唤醒开机...")
+                        continue
+                    break
 
                 final_state = state
                 sb.sleep(2)
